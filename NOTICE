@@ -1,0 +1,13 @@
+Pedro-TMAI Revived
+A Windows continuation of PedroAI, the Trackmania AI open-sourced by trackmania.ai
+(https://github.com/trackmania-ai). Work resumed on October 15, 2026.
+
+This project includes and modifies software from the trackmania-ai project:
+public-tmenv, public-tmlearn and public-op-aitool, Copyright trackmania.ai, licensed under
+the Apache License, Version 2.0 (see LICENSE). Their original history is kept in this
+repository's git history; the modifications are listed in README.md ("What changed from
+upstream") and recorded in the commits made since October 15, 2026.
+
+public-tmenv/tmenv/gbx-to-json/GbxToJson is the unchanged upstream binary built on GBX.NET
+(https://github.com/BigBang1112/gbx-net). On Windows its managed assemblies are extracted
+from it at first use; they are not redistributed separately in this repository.

@@ -1,0 +1,20 @@
+# Local environment: Python venv, caches, uv / .NET / GitHub CLI tools (re-created by the setup steps in README.md)
+.venv/
+.cache/
+tools/
+
+# Your training runs (agents, demonstrations, logs) and screenshots
+runs/
+check_capture.png
+
+# Upstream repositories kept for reference only (not modified, not needed to train)
+public-aifront/
+tmblog/
+
+# Python
+__pycache__/
+*.egg-info/
+*.pyc
+
+# Extracted on first use from public-tmenv/tmenv/gbx-to-json/GbxToJson (GBX.NET.LZO is GPL-3.0, not redistributed)
+public-tmenv/tmenv/gbx-to-json/win/
