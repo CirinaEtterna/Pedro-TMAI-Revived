@@ -5,13 +5,14 @@ __all__ = ['Exploration', 'EpsilonGreedyExploration', 'ResmaxExploration', 'Rank
 
 # %% ../../nbs/agent_dqn.ipynb 1
 import logging
-from copy import deepcopy
+from copy import copy, deepcopy
 from functools import cached_property, partial
 
 import numpy as np
 import torch
 from fastai.optimizer import Adam
 from fastcore.basics import class2attr, store_attr
+from ..neural import shared_module_copy
 
 # %% ../../nbs/agent_dqn.ipynb 3
 class Exploration:
@@ -99,6 +100,7 @@ class DqnAgent:
     def select_action(self, state, evaluation=False):
         self.net_online.eval()
         action_values = self.net_online(state).squeeze().cpu()
+        self.last_action_values = action_values.tolist()  # shown by the viewer
         if evaluation:
             return action_values.argmax()
         return self.exploration(action_values)
@@ -120,7 +122,23 @@ class DqnAgent:
 
     @cached_property
     def scaler(self):
-        return torch.cuda.amp.GradScaler()
+        return torch.amp.GradScaler(torch.device(self.device).type)
+
+    def actor_copy(self, cpu=False):
+        """Copy acting from another thread or process: its own module (train/eval flags) either sharing the
+        online weights (threads) or holding a CPU copy of them (`cpu=True`, picklable for a spawned process
+        where it is moved back to `device` and refreshed with `cpu_state_dict` snapshots)."""
+        actor = copy(self)
+        actor.__dict__ = {
+            k: v for k, v in self.__dict__.items() if k not in ("net_target", "optimizer", "scaler", "nb_batch")
+        }
+        actor.net_online = deepcopy(self.net_online).cpu() if cpu else shared_module_copy(self.net_online)
+        actor.model = actor.net_online
+        return actor
+
+    def cpu_state_dict(self):
+        "Snapshot of the online network weights on the CPU, sent to collector processes."
+        return {k: v.detach().to("cpu", copy=True) for k, v in self.net_online.state_dict().items()}
 
     def _td_estimate(self, state, action):
         return self.net_online(state)[np.arange(0, len(action)), action]
@@ -149,10 +167,11 @@ class DqnAgent:
         state, next_state, action, reward, done = zip(*batch)
 
         self.net_online.train()
-        with torch.cuda.amp.autocast():
+        with torch.autocast(torch.device(self.device).type):
             td_est = self._td_estimate(state, action)
-            td_tgt = self._td_target(reward, next_state, done)
-            loss = (self.loss_fn(td_est, td_tgt) * weights).mean()
+        # Target in float32: the eval mode target net can exceed the float16 range (inf -> nan priorities)
+        td_tgt = self._td_target(reward, next_state, done)
+        loss = (self.loss_fn(td_est.float(), td_tgt) * weights).mean()
 
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()

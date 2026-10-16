@@ -2,9 +2,9 @@
 
 # %% auto 0
 __all__ = ['CollectorWorker', 'SessionCollector', 'SessionScheduler', 'CancelEpisodeException', 'RecoverEnvException',
-           'CancelPushException', 'WandbCollectorCallback', 'WandbGhostSaver', 'ExplorationSwitcherCallback',
+           'CancelPushException', 'StopCollecting', 'ViewerPublisherCallback', 'ParamsCallback', 'WeightSyncCallback', 'WandbCollectorCallback', 'WandbGhostSaver', 'LocalEpisodeLogCallback', 'ExplorationSwitcherCallback',
            'TelemetryTimeoutRecoverCallback', 'MemoryFullRecoverCallback', 'IgnoreLaggyStepCallback',
-           'IgnoreRespawnAndUnfinished', 'IgnoreFinished', 'LagCallback', 'publish', 'PublisherCallback',
+           'ReplayBufferClient', 'IgnoreIdleDemoCallback', 'IgnoreUserRestartCallback', 'IgnoreUnfocusedStepCallback', 'IgnoreRespawnAndUnfinished', 'IgnoreFinished', 'LagCallback', 'publish', 'PublisherCallback',
            'ActionPublisherCallback', 'StepPublisherCallback', 'EigenCamPublisherCallback', 'SessionStats',
            'SessionPublisherCallback']
 
@@ -14,7 +14,7 @@ import json
 import logging
 import traceback
 from copy import copy, deepcopy
-from functools import cached_property
+from functools import cached_property, partial
 from itertools import cycle, repeat
 from pathlib import Path
 from queue import Full
@@ -33,12 +33,35 @@ from tmenv.gbx import map_from_uid
 from .callback import Callback, Callbackable
 from .net import ThreadServer
 from torch.nn.functional import relu
-from .utils import Timer, format_date
+from .params import TunableParams
+from .replay_buffer import map_tensors
+from .utils import CPU_TRANSFER, USE_THREADS, Timer, format_date
+from queue import Empty, Full
+from threading import Thread
 from torch.multiprocessing import Process
 from torchvision.transforms import Resize
 
 # %% ../nbs/collector.ipynb 3
-class CollectorWorker(Process):
+class StopCollecting(BaseException):
+    "Raised inside a collector when the learner asks it to stop (not an Exception: never triggers a recover)."
+
+
+class ReplayBufferClient:
+    "Collector side of the replay buffer in another process: only the experience queue is shipped there."
+
+    def __init__(self, replay_buffer):
+        self.experience_queue = replay_buffer.experience_queue
+
+    def push(self, *args):
+        if CPU_TRANSFER:  # no CUDA IPC on Windows: cross the process boundary on the CPU
+            args = map_tensors(args, lambda t: t.detach().cpu())
+        try:
+            self.experience_queue.put(args, False)
+        except Full:
+            logging.warning("Replay buffer queue is full")
+
+
+class CollectorWorker(Thread if USE_THREADS else Process):
     def __init__(
         self,
         env,
@@ -48,32 +71,73 @@ class CollectorWorker(Process):
         session_scheduler,
         next_map_queue,
         done_map_queue,
+        weights_queue=None,  # CPU_TRANSFER: learner weight snapshots for this worker
+        stop_event=None,  # processes: set by the learner to stop collecting cleanly
     ):
         assert env.device == agent.device
-        super().__init__()
+        super().__init__(daemon=True)
         store_attr()
-
+        if USE_THREADS:
+            # Thread workers act with their own module sharing the learner weights (like CUDA IPC sharing does)
+            self.agent = agent.actor_copy()
+        elif CPU_TRANSFER:
+            # Process workers without CUDA IPC get a picklable CPU copy, refreshed from `weights_queue`,
+            # and only the experience queue of the replay buffer (its contents may be CUDA tensors)
+            self.agent = agent.actor_copy(cpu=True)
+            self.replay_buffer = ReplayBufferClient(replay_buffer)
+            self.cbs = list(cbs) + [partial(WeightSyncCallback, weights_queue)]
 
     def run(self):
+        if not USE_THREADS:
+            if not logging.getLogger().handlers:  # spawned process: no logging configured yet
+                logging.basicConfig(
+                    format="[%(asctime)s][%(process)d][%(levelname)s]: %(message)s",
+                    datefmt="%d-%b-%y][%H:%M:%S",
+                    level=logging.INFO,
+                )
+            if CPU_TRANSFER:
+                self.agent.net_online.to(self.agent.device)
         with torch.cuda.stream(torch.cuda.Stream(self.env.device, -1)), torch.no_grad():
             try:
                 self.session_collector = SessionCollector(
-                    self.cbs, self.env, self.agent, self.replay_buffer, self.session_scheduler
+                    self.cbs, self.env, self.agent, self.replay_buffer, self.session_scheduler, self.stop_event
                 )
                 self.env.game  # Start the game
                 while (map_uid := self.next_map_queue.get()) is not None:
                     self.session_collector.execute(map_uid)
                     self.done_map_queue.put(map_uid)
-            except KeyboardInterrupt:
-                logging.info("Received KeyboardInterrupt, destroying env and worker !")
+            except (KeyboardInterrupt, StopCollecting):
+                logging.info(f"Collector {self.env.name} stopping, closing the env")
                 self.env.close()
+            except Exception:
+                logging.exception(f"Collector worker {self.env.name} crashed")
+                self.env.close()
+                raise
+            finally:
+                if not USE_THREADS:
+                    # A process that put items on a queue blocks at exit until they are flushed to the pipe:
+                    # don't wait for experiences / payloads the learner may no longer read.
+                    self.replay_buffer.experience_queue.cancel_join_thread()
+                    for cb in getattr(getattr(self, "session_collector", None), "cbs", []):
+                        q = getattr(cb, "publisher_queue", None)
+                        if q is not None and hasattr(q, "cancel_join_thread"):
+                            q.cancel_join_thread()
+
+    if USE_THREADS:
+        def kill(self):
+            self.env.close()
 
 
 class SessionCollector(Callbackable):
-    def __init__(self, cbs, env, agent, replay_buffer, session_scheduler):
+    def __init__(self, cbs, env, agent, replay_buffer, session_scheduler, stop_event=None):
         super().__init__(cbs)
         store_attr(but="cbs")
+        self.env.unwrapped.stop_check = self.check_stop  # lets the env's user waits stop cleanly
         self("after_init")
+
+    def check_stop(self):
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise StopCollecting()
 
     def execute(self, map_uid):
         self.map_uid = map_uid
@@ -81,6 +145,7 @@ class SessionCollector(Callbackable):
         self("before_load_map")
         loaded = False
         while not loaded:
+            self.check_stop()
             try:
                 self.env.load_map(self.map_uid)
                 loaded = True
@@ -89,6 +154,7 @@ class SessionCollector(Callbackable):
                 self.env.recover()
         self("before_session")
         while not self.session_scheduler.done:
+            self.check_stop()
             try:
                 self.collect_episode()
             except Exception as e:
@@ -114,19 +180,23 @@ class SessionCollector(Callbackable):
         self("after_done")
 
     def collect_step(self):
+        self.check_stop()
         self("before_collect_step")
         self.action = self.agent.select_action(self.state)
+        self.ai_action = self.action  # kept for the viewer: in master-learn `action` becomes the user's
         self("before_env_step")
         self.next_state, self.reward, self.done, self.info = self.env.step(self.action)
+        if self.info.get("user_action") is not None:
+            self.action = self.info["user_action"]  # master-learn: the transition carries the user's action
+        if USE_THREADS and torch.cuda.is_available():
+            # States are produced on this worker stream and consumed by the learner thread on its own stream
+            torch.cuda.current_stream().synchronize()
         try:
             self("after_env_step")
-            self.replay_buffer.push(
-                self.state,
-                self.next_state,
-                self.action,
-                self.reward,
-                self.done or self.info["must_respawn"],
-            )
+            transition = [self.state, self.next_state, self.action, self.reward, self.done or self.info["must_respawn"]]
+            if self.env.passive:
+                transition.append(dict(demo=True, map_uid=self.env.map_data["uid"]))
+            self.replay_buffer.push(*transition)
         except CancelPushException:
             pass
         self("after_step_push")
@@ -215,7 +285,7 @@ class WandbCollectorCallback(Callback):
             id=run[0].id,
             resume="must",
             config=self.parent.env.config,
-            reinit=True,
+            reinit="create_new" if USE_THREADS else True,
         )
         state_dict = self.run.summary.get("state_dict")
         if state_dict:
@@ -231,7 +301,7 @@ class WandbCollectorCallback(Callback):
             job_type="collect",
             group=self.group,
             config=self.parent.env.config,
-            reinit=True,
+            reinit="create_new" if USE_THREADS else True,
         )
 
     def before_session(self):
@@ -296,6 +366,167 @@ class WandbGhostSaver(ThreadServer):
     def save_url(self):
         return f"http://127.0.0.1:{self.port}/save"
 
+class LocalEpisodeLogCallback(Callback):
+    "Offline replacement of WandbCollectorCallback: one json line per episode in `<run_dir>/episodes.jsonl`."
+
+    keys = ("session", "medal", "progress", "racetime", "finish_racetime", "no_respawn_finish_racetime",
+            "total_reward", "total_step_count", "total_respawn_count", "telemetry_lag", "collect_lag", "step_period")
+
+    def __init__(self, run_dir):
+        self.path = Path(run_dir) / "episodes.jsonl"
+        self.episode = 0
+
+    def after_reset(self):
+        # ExplorationSwitcherCallback switches exploration in after_done: remember the one used by this episode
+        self.exploration = getattr(getattr(self.parent.agent, "exploration", None), "name", None)
+
+    def after_done(self):
+        env, info = self.parent.env, self.parent.info
+        record = dict(
+            time=format_date("%Y-%m-%d %H:%M:%S"),
+            env=env.name,
+            map=env.map_data["sanitized_name"],
+            map_uid=env.map_data["uid"],
+            exploration=getattr(self, "exploration", None),
+            demo=bool(env.passive),
+        ) | {k: info[k] for k in self.keys if k in info}
+        record = {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        self.episode += 1
+        racetime = record.get("finish_racetime")
+        logging.info(
+            f"[{env.name}] {record['map']} | progress {record.get('progress', 0):.1%} | "
+            f"{'finish ' + format(racetime / 1000, '.3f') + 's' if racetime else 'not finished'} | "
+            f"medal {record.get('medal')} | reward {record.get('total_reward', 0):.1f} | {record['exploration']}"
+        )
+
+
+class ViewerPublisherCallback(Callback):
+    "Send a compact step payload (and a JPEG of the AI's view every `frame_every` s) to the viewer."
+
+    def __init__(self, publisher_queue, frame_every=0.2):
+        self.publisher_queue = publisher_queue
+        self.frame_every = frame_every
+        self.last_frame_time = 0.0
+
+    def publish(self, payload):
+        publish(self.publisher_queue, payload)  # module level helper defined further down, resolved at call time
+
+    def after_env_step(self):
+        env, info, agent = self.parent.next_state["env"], self.parent.info, self.parent.agent
+        exploration = getattr(agent, "exploration", None)
+        payload = dict(
+            env=self.parent.env.name,
+            racetime=env["racetime"],
+            speed=env["velocity_norm"] * 3.6,
+            progress=info.get("progress", 0.0),
+            reward=float(self.parent.reward),
+            episode_reward=info.get("total_reward", 0.0),
+            action=int(getattr(self.parent, "ai_action", self.parent.action)),
+            user_action=info.get("user_action"),
+            q_values=getattr(agent, "last_action_values", None),
+            exploration=getattr(exploration, "name", None),
+            action_tier=getattr(exploration, "action_tier", None),
+            step_period=info.get("step_period"),
+            mistake=env.get("trajectory", {}).get("mistake", False),
+            finished=env["finished"],
+            master_learn=bool(self.parent.env.passive),
+        )
+        if self.frame_every < time() - self.last_frame_time and "visual" in self.parent.next_state:
+            self.last_frame_time = time()
+            payload["frame"] = self.encode_frame(self.parent.next_state["visual"])
+        self.publish(payload)
+
+    @staticmethod
+    def encode_frame(visual):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        if visual.dtype != torch.uint8:
+            visual = (visual * 255).clamp(0, 255).to(torch.uint8)
+        array = visual.detach().permute(1, 2, 0).cpu().numpy()[:, :, ::-1]  # BGR capture -> RGB
+        buf = BytesIO()
+        Image.fromarray(array.copy()).save(buf, format="JPEG", quality=70)
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+class ParamsCallback(Callback):
+    "Collector side of the live parameters: poll params.json, apply to the env wrappers and the agent."
+
+    def __init__(self, path):
+        self.params = TunableParams(path)
+
+    def wrappers(self):
+        env = self.parent.env
+        while env is not None:
+            yield env
+            env = getattr(env, "env", None)
+
+    def apply(self, episode_boundary=False):
+        p = self.params
+        for w in self.wrappers():
+            for name in ("travel_weight", "mistake_penalty", "respawn_penalty", "finish_bonus", "max_mistake_duration"):
+                if name in w.__dict__:
+                    setattr(w, name, p[name])
+        if p["exploration"] != "cycle":
+            from .agent.dqn import EpsilonGreedyExploration, NoExploration
+
+            current = getattr(self.parent.agent, "exploration", None)
+            if p["exploration"] == "greedy":
+                if not isinstance(current, NoExploration):
+                    self.parent.agent.exploration = NoExploration()
+            elif not isinstance(current, EpsilonGreedyExploration) or current.epsilon != p["epsilon"]:
+                self.parent.agent.exploration = EpsilonGreedyExploration(p["epsilon"])
+        if episode_boundary:
+            unwrapped = self.parent.env.unwrapped
+            if unwrapped.passive != p["master_learn"]:
+                unwrapped.set_passive(p["master_learn"])
+                logging.info("Master-learn " + ("ON: you drive, the AI watches and records" if p["master_learn"] else "OFF: the AI drives"))
+
+    def before_session(self):
+        self.params.poll()
+        self.apply(episode_boundary=True)
+        self.parent.env.unwrapped.wait_hook = self.poll_while_waiting
+        self._last_wait_poll = 0.0
+
+    def after_done(self):
+        self.params.poll()
+        self.apply(episode_boundary=True)
+
+    def before_collect_step(self):
+        if self.params.poll():
+            self.apply()
+
+    def poll_while_waiting(self):
+        "Called by the env while it waits for the user to start: apply changes; True = stop waiting (master-learn off)."
+        if 0.5 < time() - self._last_wait_poll:
+            self._last_wait_poll = time()
+            if self.params.poll():
+                self.apply(episode_boundary=True)
+        return not self.params["master_learn"]
+
+
+class WeightSyncCallback(Callback):
+    "Collector process side of the weight sync: load the latest snapshot published by the learner."
+
+    def __init__(self, weights_queue):
+        store_attr()
+
+    def before_collect_step(self):
+        latest = None
+        try:
+            while True:
+                latest = self.weights_queue.get_nowait()
+        except Empty:
+            pass
+        if latest is not None:
+            self.parent.agent.net_online.load_state_dict(latest, strict=False)
+            self.nb_sync = getattr(self, "nb_sync", 0) + 1
+            logging.log(logging.INFO if self.nb_sync == 1 else logging.DEBUG, "Weights synced from the learner")
+
+
 # %% ../nbs/collector.ipynb 10
 class ExplorationSwitcherCallback(Callback):
     def __init__(self, explorations):
@@ -331,7 +562,8 @@ class TelemetryTimeoutRecoverCallback(Callback):
 
     def after_env_step(self):
         delay = time() - self.parent.env.game.telemetry["_updatetime"]
-        if self.timeout < delay:
+        timeout = self.timeout * (10 if self.parent.env.passive else 1)  # restarts pause the telemetry
+        if timeout < delay:
             raise RecoverEnvException(
                 f"Telemetry delay {delay} > timeout {self.timeout}"
             )
@@ -355,6 +587,43 @@ class IgnoreLaggyStepCallback(Callback):
 
     def after_env_step(self):
         if self.timeout < time() - self.parent.env.game.telemetry["_updatetime"]:
+            raise CancelPushException()
+
+
+class IgnoreIdleDemoCallback(Callback):
+    "Master-learn: don't record the user standing at the start line (steps before the car first moves)."
+
+    def __init__(self):
+        self.moved = False
+
+    def after_reset(self):
+        self.moved = False
+
+    def after_env_step(self):
+        if not self.parent.env.passive:
+            return
+        if not self.moved and 5.0 < self.parent.next_state["env"]["velocity_norm"] * 3.6:
+            self.moved = True
+        if not self.moved:
+            raise CancelPushException()
+
+
+class IgnoreUserRestartCallback(Callback):
+    "Master-learn: a restart by the user ends the episode but is not a failure to learn from."
+
+    def after_env_step(self):
+        if self.parent.info.get("user_restart"):
+            raise CancelPushException()
+
+
+class IgnoreUnfocusedStepCallback(Callback):
+    "Don't learn from steps taken while the game window was not focused (the inputs were not delivered)."
+
+    def after_env_step(self):
+        if self.parent.env.passive:
+            return  # master-learn: the user's inputs are never paused
+        window = getattr(self.parent.env.game, "window", None)
+        if getattr(window, "inputs_paused", False):
             raise CancelPushException()
 
 

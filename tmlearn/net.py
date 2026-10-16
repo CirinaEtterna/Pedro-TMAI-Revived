@@ -9,6 +9,7 @@ import json
 import logging
 import queue
 from threading import Thread
+from time import sleep, time
 
 import torch.multiprocessing as mp
 import websockets
@@ -20,10 +21,16 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 class ThreadServer:
     def __init__(self, app, **kwargs):
         self.server = Server(Config(app, **kwargs))
-        self.thread = Thread(target=self.server.run)
+        self.thread = Thread(target=self.server.run, daemon=True)
         self.thread.start()
+        start = time()
         while not self.server.started:
-            pass
+            if not self.thread.is_alive() or 30 < time() - start:
+                raise RuntimeError(f"Could not start the server on {kwargs.get('host')}:{kwargs.get('port')} (port in use?)")
+            sleep(0.01)
+
+    def stop(self):
+        self.server.should_exit = True
 
     @property
     def port(self):

@@ -2,12 +2,17 @@
 
 # %% auto 0
 __all__ = ['Training', 'MapScheduler', 'OneMapScheduler', 'ExperienceTimeoutException', 'ExperienceTimeoutCallback',
-           'LrSchedulerCallback', 'WandbSaveAgentSlidingCallback', 'WandbSaveAgentPersistentCallback']
+           'LrSchedulerCallback', 'WandbSaveAgentSlidingCallback', 'WandbSaveAgentPersistentCallback',
+           'LearnerParamsCallback', 'WeightPublishCallback', 'LocalSaveAgentCallback']
 
 # %% ../nbs/training.ipynb 1
 import json
 import logging
+import os
+import queue
+from collections import deque
 from collections.abc import Iterator
+from queue import Empty, Full
 from functools import partial
 from itertools import cycle
 from pathlib import Path
@@ -15,6 +20,7 @@ from threading import Thread
 from time import sleep, time
 
 import torch
+import torch.multiprocessing as mp
 import wandb
 from fastcore.basics import store_attr
 from fastcore.foundation import L, Self
@@ -26,13 +32,19 @@ from .callback import Callback, Callbackable
 from tmlearn.collector import (
     ActionPublisherCallback,
     CollectorWorker,
+    LocalEpisodeLogCallback,
+    ParamsCallback,
+    ViewerPublisherCallback,
     SessionPublisherCallback,
     StepPublisherCallback,
     WandbCollectorCallback,
     EigenCamPublisherCallback,
 )
 from .net import WebsocketServer
-from .utils import Timer, format_date, format_duration
+from .params import TunableParams
+from .replay_buffer import map_tensors
+from .utils import CPU_TRANSFER, USE_THREADS, Timer, format_date, format_duration
+from .viewer import Viewer
 
 # %% ../nbs/training.ipynb 3
 class Training(Callbackable):
@@ -47,50 +59,193 @@ class Training(Callbackable):
         training_cbs=[],
         batch_size=32,
         burnin=1024,
-        online=True,  # Activate websocket and wandb logging
+        online=True,  # wandb logging and agent storage (needs a wandb account)
         log_every=2,
         ws_port=2013,
+        websocket=None,  # live websocket feed for aifront overlays, defaults to `online`
         wandb_project="tmaifoo",
         wandb_entity="trackmania-ai",
         wandb_load_group=None,
         wandb_load_agent="agent-latest.pth",
+        run_dir="runs",  # offline mode: local folder for agents, training state and logs
+        resume=None,  # offline mode: name of the run in `run_dir` to resume
+        viewer=True,  # local web viewer on http://127.0.0.1:<viewer_port>
+        viewer_port=2014,
+        params_overrides=None,  # initial values for params.json (see tmlearn.params.SCHEMA)
+        demos=None,  # run name or demos.pt path whose demonstrations are loaded into the replay buffer
     ):
         super().__init__(training_cbs)
         store_attr(but="training_cbs")
+        if self.websocket is None:
+            self.websocket = self.online
+        if self.websocket:
+            self.ws_server = WebsocketServer(port=self.ws_port)
 
         if self.online:
             self.wandb_api = wandb.Api()
-            self.ws_server = WebsocketServer(port=self.ws_port)
             self.init_wandb_run()
             self.add_cb(WandbSaveAgentSlidingCallback)
             self.add_cb(WandbSaveAgentPersistentCallback)
             self.load_state_dict(json.loads(self.wandb_run.summary.get("state_dict")))
-            self.log_timer = Timer(self.log_every)
+        else:
+            self.init_local_run()
+        self.log_timer = Timer(self.log_every)
+        self.recent_metrics = deque(maxlen=600)
+        self.params = TunableParams(Path(self.save_dir) / "params.json", params_overrides)
+        logging.info(f"Live parameters ({self.params.path}): {self.params.as_dict()}")
+        self.add_cb(LearnerParamsCallback)
+        for path in self.demo_files():
+            self.load_demos(path)
 
+        self.stop_event = None if USE_THREADS else mp.Event()
+        self.weights_queues = []
+        self.viewer_queue = mp.Queue(8) if self.viewer else None
+        if CPU_TRANSFER:
+            self.add_cb(WeightPublishCallback)
         self.map_scheduler.start()
         self.collectors_worker = L(envs).map(self.build_worker)
         self.collectors_worker.map(Self.start())
+        self.viewer_server = None
+        if self.viewer:
+            names = getattr(envs[0].action_handler, "action_names", None)
+            try:
+                self.viewer_server = Viewer(self, viewer_port, action_names=names)
+            except RuntimeError as e:
+                logging.warning(f"Viewer disabled: {e}")
+
+    def demo_files(self):
+        files = []
+        if self.demos:
+            p = Path(self.demos)
+            files.append(p if p.suffix == ".pt" else Path(self.run_dir) / self.demos / "demos.pt")
+        own = Path(self.save_dir) / "demos.pt"
+        if self.resume and own.exists() and own not in files:
+            files.append(own)
+        return files
+
+    def load_demos(self, path):
+        path = Path(path)
+        if not path.exists():
+            logging.warning(f"No demonstrations found at {path}")
+            return
+        demos = torch.load(path, map_location="cpu", weights_only=False)
+        self.replay_buffer.load_demos(demos)
+        if path.resolve() == (Path(self.save_dir) / "demos.pt").resolve():
+            self._saved_demo_count = self.replay_buffer.demo_count()  # imported demos still get saved here
+        logging.info(f"Loaded {len(demos)} demonstration transitions from {path}")
 
     def fit(self):
         self("before_fit")
-        while len(self.replay_buffer) < self.burnin:
-            sleep(0.1)
-            self.replay_buffer.empty_queue()
-            if self.online:
-                self.wandb_run.summary["state_dict"] = json.dumps(self.state_dict())
-        logging.info("Burnin completed. Time to learn !")
-        self("after_burnin")
-        while True:
-            self.replay_buffer.empty_queue()
-            self("before_fit_one_batch")
-            batch, indices, weights = self.replay_buffer.sample(self.batch_size)
-            errors, metrics = self.agent.fit_one_batch(batch, weights)
-            self("after_fit_one_batch")
-            self.replay_buffer.update_priorities(indices, errors)
-            if self.online and self.log_timer():
-                self.wandb_run.log(metrics)
-                self.wandb_run.summary["state_dict"] = json.dumps(self.state_dict())
-                self.log_timer.reinit()
+        try:
+            last_burnin_log = 0
+            while len(self.replay_buffer) < self.burnin:
+                sleep(0.1)
+                self.replay_buffer.empty_queue()
+                if self.online:
+                    self.wandb_run.summary["state_dict"] = json.dumps(self.state_dict())
+                elif 30 < time() - last_burnin_log:
+                    logging.info(f"Burn-in: {len(self.replay_buffer)}/{self.burnin} experiences collected")
+                    last_burnin_log = time()
+            logging.info("Burnin completed. Time to learn !")
+            self("after_burnin")
+            while True:
+                self.replay_buffer.empty_queue()
+                self("before_fit_one_batch")
+                batch, indices, weights = self.replay_buffer.sample(self.batch_size)
+                errors, metrics = self.agent.fit_one_batch(batch, weights)
+                self("after_fit_one_batch")
+                self.replay_buffer.update_priorities(indices, errors)
+                if self.log_timer():
+                    self.log_metrics(metrics)
+                    self.log_timer.reinit()
+        except KeyboardInterrupt:
+            logging.info("KeyboardInterrupt: stopping training.")
+        finally:
+            self.stop_workers()  # first: drains the collector's last experiences (demonstrations) into the buffer
+            if not self.online:
+                self.save_checkpoint(wait=True)
+                logging.info(f"Agent and training state saved in {self.save_dir}")
+            if self.viewer_server is not None:
+                self.viewer_server.stop()
+
+    def stop_workers(self, timeout=15):
+        "Ask the collectors to stop (they release the game inputs), force them after `timeout` seconds."
+        if self.stop_event is not None:
+            self.stop_event.set()
+        for worker in self.collectors_worker:
+            if USE_THREADS:
+                worker.kill()
+            else:
+                start = time()
+                while worker.is_alive() and time() - start < timeout:
+                    self.replay_buffer.empty_queue()  # keep draining so the collector can flush and exit
+                    worker.join(0.2)
+                if worker.is_alive():
+                    logging.warning(f"Collector {worker.env.name} did not stop in {timeout}s, terminating it")
+                    worker.terminate()
+        for q in self.weights_queues:
+            q.cancel_join_thread()  # an unconsumed snapshot must not block this process at exit
+
+    def log_metrics(self, metrics):
+        record = dict(time=format_date("%Y-%m-%d %H:%M:%S"), batches=self.agent.nb_batch,
+                      replay_buffer=len(self.replay_buffer), **metrics)
+        self.recent_metrics.append(dict(record, _time=time()))
+        if self.online:
+            self.wandb_run.log(metrics)
+            self.wandb_run.summary["state_dict"] = json.dumps(self.state_dict())
+            return
+        self.nb_logged = getattr(self, "nb_logged", 0) + 1
+        with (self.save_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        if self.nb_logged % 30 == 1:
+            logging.info(
+                f"Learner: {record['batches']} batches | loss {metrics['loss']:.4f} | "
+                f"td error {metrics['mean_errors']:.4f} | lr {metrics['lr']:.2e} | buffer {record['replay_buffer']}")
+
+    def init_local_run(self):
+        root = Path(self.run_dir)
+        if self.resume is not None:
+            self.group = self.resume
+            self.save_dir = root / self.group
+            assert (self.save_dir / "agent-latest.pth").exists(), f"No agent-latest.pth in {self.save_dir}"
+        else:
+            while (root / (group := generate_id(word_count=3))).exists():
+                pass
+            self.group = group
+            self.save_dir = root / self.group
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Run '{self.group}' is saved in {self.save_dir.resolve()}")
+        self.add_cb(LocalSaveAgentCallback)
+        if self.resume is not None:
+            self.agent.load_state_dict(torch.load(self.save_dir / "agent-latest.pth", map_location=self.agent.device))
+            state_path = self.save_dir / "state.json"
+            if state_path.exists():
+                self.load_state_dict(json.loads(state_path.read_text(encoding="utf-8-sig")))
+            logging.info(f"Resumed agent and training state from {self.save_dir}")
+
+    def save_checkpoint(self, wait=False):
+        "Offline mode: agent-latest.pth + training state (map schedule, lr schedule offset, ...) + demonstrations."
+        self.save_agent("latest", overwrite_latest=False)
+        _atomic_write_text(self.save_dir / "state.json", json.dumps(self.state_dict()))
+        demos = self.replay_buffer.demos()
+        saver = getattr(self, "_demo_saver", None)
+        if saver is not None and saver.is_alive():
+            if not wait:
+                return  # the previous demonstration save is still writing
+            saver.join()
+        if demos and len(demos) != getattr(self, "_saved_demo_count", 0):
+            # Device-to-host copy here (fast), the (slow) file write in a thread so the learner keeps draining
+            cpu_demos = map_tensors(demos, lambda t: t.detach().cpu())
+            self._demo_saver = Thread(target=self._save_demos, args=(cpu_demos, self.save_dir / "demos.pt", len(demos)),
+                                      name="demo-saver")
+            self._demo_saver.start()
+            if wait:
+                self._demo_saver.join()
+
+    def _save_demos(self, cpu_demos, path, count):
+        _atomic_torch_save(cpu_demos, path)
+        self._saved_demo_count = count
+        logging.info(f"Saved {count} demonstration transitions to {path}")
 
     def init_wandb_run(self):
         if self.wandb_load_group is not None:
@@ -117,6 +272,7 @@ class Training(Callbackable):
                 tags=["training"] + self.agent.tags,
             )
             self.wandb_run.summary["state_dict"] = json.dumps(self.state_dict())
+        self.group = self.wandb_run.group
         self.save_dir = Path(self.wandb_run.dir) / "agent"
         logging.debug(f"Saving agents locally to {self.save_dir}")
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -127,16 +283,11 @@ class Training(Callbackable):
     def save_agent(self, raw_name, state_dict=None, overwrite_latest=True):
         if state_dict is None:
             state_dict = self.agent.state_dict()
-        torch.save(
-            state_dict,
-            self.save_dir / f"agent-{raw_name}.pth",
-        )
+        _atomic_torch_save(state_dict, self.save_dir / f"agent-{raw_name}.pth")
         if overwrite_latest:
-            torch.save(
-                state_dict,
-                self.save_dir / f"agent-latest.pth",
-            )
-        self.wandb_run.save("agent/*.pth", policy="now")
+            _atomic_torch_save(state_dict, self.save_dir / f"agent-latest.pth")
+        if self.online:
+            self.wandb_run.save("agent/*.pth", policy="now")
 
     def load_agent(self, file, run_path=None):
         if run_path is None:
@@ -153,15 +304,20 @@ class Training(Callbackable):
         return L(self.wandb_api.runs(self.wandb_path, filters))
 
     def build_worker(self, env):
-        online_cbs = []
+        extra_cbs = []
         if self.online:
-            online_cbs += [
+            extra_cbs.append(
                 partial(
                     WandbCollectorCallback,
                     project=self.wandb_project,
                     entity=self.wandb_entity,
                     group=self.wandb_run.group,
-                ),
+                )
+            )
+        else:
+            extra_cbs.append(partial(LocalEpisodeLogCallback, self.save_dir))
+        if self.websocket:
+            extra_cbs += [
                 partial(
                     ActionPublisherCallback,
                     self.ws_server.add_publisher(f"{env.name}-action"),
@@ -170,24 +326,38 @@ class Training(Callbackable):
                     StepPublisherCallback,
                     self.ws_server.add_publisher(f"{env.name}-step"),
                 ),
+            ]
+        if self.websocket and self.online:
+            # Session stats are read back from wandb
+            extra_cbs.append(
                 partial(
                     SessionPublisherCallback,
                     self.ws_server.add_publisher(f"{env.name}-session"),
-                ),
-                # partial(
-                #     EigenCamPublisherCallback,
-                #     self.ws_server.add_publisher(f"{env.name}-cam"),
-                # ),
-            ]
+                )
+            )
+            # partial(
+            #     EigenCamPublisherCallback,
+            #     self.ws_server.add_publisher(f"{env.name}-cam"),
+            # ),
 
+        # The viewer callback goes first so that steps dropped by Ignore* callbacks are still shown,
+        # the params callback last so that it overrides the exploration switcher
+        first_cbs = [partial(ViewerPublisherCallback, self.viewer_queue)] if self.viewer_queue is not None else []
+        extra_cbs.append(partial(ParamsCallback, str(self.params.path)))
+        weights_queue = None
+        if CPU_TRANSFER:
+            weights_queue = mp.Queue(1)
+            self.weights_queues.append(weights_queue)
         return CollectorWorker(
             env,
-            self.collector_cbs + online_cbs,
+            first_cbs + self.collector_cbs + extra_cbs,
             self.agent,
             self.replay_buffer,
             self.session_scheduler,
             self.map_scheduler.next_queue,
             self.map_scheduler.done_queue,
+            weights_queue=weights_queue,
+            stop_event=self.stop_event,
         )
 
     def state_dict(self):
@@ -200,6 +370,18 @@ class Training(Callbackable):
         if "cbs" in state_dict:
             self.load_cbs_state_dict(state_dict["cbs"])
 
+
+def _atomic_torch_save(obj, path):
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
 # %% ../nbs/training.ipynb 4
 class MapScheduler:
     def __init__(self, maps_uid):
@@ -207,12 +389,12 @@ class MapScheduler:
         self.maps_uid = maps_uid
         self.next_maps = L()  # maps to be queued
         self.queued_maps = L()  # queued maps not done yet
-        self.next_queue = Queue(1)
-        self.done_queue = Queue()
+        self.next_queue = queue.Queue(1) if USE_THREADS else Queue(1)
+        self.done_queue = queue.Queue() if USE_THREADS else Queue()
 
     def start(self):
-        Thread(target=self.next_maps_target).start()
-        Thread(target=self.done_maps_target).start()
+        Thread(target=self.next_maps_target, daemon=True).start()
+        Thread(target=self.done_maps_target, daemon=True).start()
 
     def next_maps_target(self):
         while True:
@@ -235,15 +417,17 @@ class MapScheduler:
         return dict(next_maps=list(self.next_maps), queued_maps=list(self.queued_maps))
 
     def load_state_dict(self, state_dict):
+        if not state_dict:  # e.g. the run was trained on a single map (OneMapScheduler has no state)
+            return
         self.next_maps = L(state_dict["queued_maps"] + state_dict["next_maps"])
 
 class OneMapScheduler:
     def __init__(self, map_uid):
         self.map_uid = map_uid
-        self.next_queue = Queue(100)
+        self.next_queue = queue.Queue(100) if USE_THREADS else Queue(100)
         while not self.next_queue.full():
             self.next_queue.put(map_uid)
-        self.done_queue = Queue()
+        self.done_queue = queue.Queue() if USE_THREADS else Queue()
 
     def start(self):
         pass
@@ -265,7 +449,10 @@ class ExperienceTimeoutCallback(Callback):
 
     def before_fit_one_batch(self):
         if self.timeout < time() - self.parent.replay_buffer.last_insert_time:
-            self.parent.collectors_worker.map(Self.kill())
+            params = getattr(self.parent, "params", None)
+            if params is not None and params["master_learn"]:
+                return  # master-learn: experiences only arrive while the user drives
+            self.parent.stop_workers()
             raise ExperienceTimeoutException(
                 f"Replay buffer received no new experiences for more than {format_duration(self.timeout)}."
             )
@@ -281,7 +468,7 @@ class LrSchedulerCallback(Callback):
         self.start_time = time() - self.offset
 
     def before_fit_one_batch(self):
-        lr = self.scheduler(min(1, (time() - self.start_time) / self.max_time))
+        lr = self.scheduler(min(1, (time() - self.start_time) / self.max_time)) * getattr(self.parent, "lr_scale", 1.0)
         self.parent.agent.set_lr(lr)
 
     def state_dict(self):
@@ -331,3 +518,68 @@ class WandbSaveAgentPersistentCallback(Callback):
 
     def load_state_dict(self, state_dict):
         self.offset = state_dict["offset"]
+
+
+class LearnerParamsCallback(Callback):
+    "Learner side of the live parameters: learning rate scale, batch size, demonstration priority bonus."
+
+    def before_fit(self):
+        self.apply()
+
+    def before_fit_one_batch(self):
+        if self.parent.params.poll():
+            self.apply()
+
+    def apply(self):
+        p = self.parent.params
+        self.parent.lr_scale = p["lr_scale"]
+        self.parent.batch_size = p["batch_size"]
+        self.parent.replay_buffer.demo_priority_bonus = p["demo_priority_bonus"]
+
+
+class WeightPublishCallback(Callback):
+    "Learner side of the weight sync for collector processes without CUDA IPC: a CPU snapshot every `every` s."
+
+    def __init__(self, every=10):
+        store_attr()
+
+    def before_fit(self):
+        self.timer = Timer(self.every)
+
+    def after_burnin(self):
+        self.publish()
+
+    def before_fit_one_batch(self):
+        if self.timer():
+            self.publish()
+            self.timer.reinit()
+
+    def publish(self):
+        snapshot = self.parent.agent.cpu_state_dict()
+        for q in self.parent.weights_queues:
+            try:
+                q.get_nowait()  # drop a snapshot the collector has not picked up yet
+            except Empty:
+                pass
+            try:
+                q.put_nowait(snapshot)
+            except Full:
+                pass
+
+
+class LocalSaveAgentCallback(Callback):
+    "Offline replacement of the wandb save callbacks: checkpoint every `every` s, dated snapshot every `snapshot_every` s."
+
+    def __init__(self, every=10 * 60, snapshot_every=6 * 3600):
+        store_attr()
+
+    def before_fit(self):
+        self.timer, self.snapshot_timer = Timer(self.every), Timer(self.snapshot_every)
+
+    def before_fit_one_batch(self):
+        if self.snapshot_timer():
+            self.parent.save_agent(format_date("%Y-%m-%d_%H-%M"), overwrite_latest=False)
+            self.snapshot_timer.reinit()
+        if self.timer():
+            self.parent.save_checkpoint()
+            self.timer.reinit()
