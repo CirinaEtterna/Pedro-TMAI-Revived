@@ -143,3 +143,6 @@ checklink/cookies.txt
 
 _docs/
 sidebar.yml
+
+# Extracted on first use from gbx-to-json/GbxToJson (see gbx-to-json/extract_bundle.py)
+tmenv/gbx-to-json/win/

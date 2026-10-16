@@ -11,12 +11,16 @@ from itertools import repeat
 from pathlib import Path
 from time import sleep, time
 
+import sys
+
 import numpy as np
 from fastcore.foundation import L
-from .gamepad import TmGamepad
-from .prefix import Prefix
 from .socket import Socket
-from .window import TmWindow
+
+if sys.platform != "win32":  # Linux wine backend, see `tmenv.win32` for Windows
+    from .gamepad import TmGamepad
+    from .prefix import Prefix
+    from .window import TmWindow
 
 # %% ../nbs/game.ipynb 3
 class LoadMapTimeoutException(Exception):
@@ -94,8 +98,29 @@ class Game:
         sleep(2)
         self.prefix.save_credential(self.credential_path)
 
+    passive = False  # master-learn: the user drives, `act` must not send inputs
+    stop_check = None  # callable raising when the collector is asked to stop (set by Tmenv)
+
+    def wait_user_start(self, stop_check=None):
+        "Wait for a race (re)start by the user: racetime goes through the countdown (<= 0), then positive."
+
+        def racetime():
+            if stop_check is not None:
+                stop_check()
+            return self.telemetry.get("racetime", 1)
+
+        t = self.telemetry
+        if 0 <= t.get("racetime", 1) <= 1500 and t.get("speed", 0) < 1:
+            return  # already standing at the start line
+        while 0 < racetime():
+            sleep(0.02)
+        while racetime() <= 0:
+            sleep(0.01)
+
     def act(self, accelerate, brake, steer, check_socket=True):
         assert not check_socket or self.socket.connected
+        if self.passive:
+            return
         # Hybrid method because gamepad has more latency
         self.window.act(accelerate, brake, 0)
         self.gamepad.act(False, False, steer)
