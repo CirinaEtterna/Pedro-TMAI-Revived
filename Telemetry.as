@@ -2,7 +2,7 @@ namespace Telemetry
 {
     void SendConfig(Net::Socket@ sock) {
         sock.WriteRaw(
-            '{' + string::Join({
+            '{' + Text::Join({
                 '"finished":"?"',
                 '"ui_sequence":"I"',
                 '"landmark_index":"I"',
@@ -17,7 +17,7 @@ namespace Telemetry
                 '"accelerate":"f"',
                 '"brake":"?"',
                 '"distance":"f"',
-                '"speed":"I"',
+                '"speed":"f"',
                 '"accel_coef":"f"',
                 '"control_coef":"f"',
                 '"gravity_coef":"f"',
@@ -130,7 +130,7 @@ namespace Telemetry
         );
 
         sock.Write(BoolBytes(finished));
-        sock.Write(terminal.UISequence_Current);
+        sock.Write(uint(terminal.UISequence_Current));
         sock.Write(vp.CurrentLaunchedRespawnLandmarkIndex);
         sock.Write(vp.CurrentStoppedRespawnLandmarkIndex);
         sock.Write(GetRaceTime(sapi));
@@ -158,8 +158,8 @@ namespace Telemetry
         sock.Write(sapi.HandicapNoBrakesDuration);
         sock.Write(sapi.HandicapNoSteeringDuration);
         sock.Write(sapi.HandicapNoGripDuration);
-        sock.Write(vps.ReactorBoostLvl);
-        sock.Write(vps.ReactorBoostType);
+        sock.Write(uint(vps.ReactorBoostLvl));
+        sock.Write(uint(vps.ReactorBoostType));
         sock.Write(BoolBytes(vps.ReactorInputsX));
         sock.Write(BoolBytes(vps.IsGroundContact));
         sock.Write(BoolBytes(vps.IsReactorGroundMode));
@@ -189,7 +189,7 @@ namespace Telemetry
         sock.Write(vps.FLBreakNormedCoef);
         sock.Write(vps.FLTireWear01);
         sock.Write(vps.FLIcing01);
-        sock.Write(vps.FLGroundContactMaterial);
+        sock.Write(uint(vps.FLGroundContactMaterial));
         sock.Write(vps.FRSteerAngle);
         sock.Write(vps.FRWheelRot);
         sock.Write(vps.FRDamperLen);
@@ -198,7 +198,7 @@ namespace Telemetry
         sock.Write(vps.FRBreakNormedCoef);
         sock.Write(vps.FRTireWear01);
         sock.Write(vps.FRIcing01);
-        sock.Write(vps.FRGroundContactMaterial);
+        sock.Write(uint(vps.FRGroundContactMaterial));
         sock.Write(vps.RLSteerAngle);
         sock.Write(vps.RLWheelRot);
         sock.Write(vps.RLDamperLen);
@@ -207,7 +207,7 @@ namespace Telemetry
         sock.Write(vps.RLBreakNormedCoef);
         sock.Write(vps.RLTireWear01);
         sock.Write(vps.RLIcing01);
-        sock.Write(vps.RLGroundContactMaterial);
+        sock.Write(uint(vps.RLGroundContactMaterial));
         sock.Write(vps.RRSteerAngle);
         sock.Write(vps.RRWheelRot);
         sock.Write(vps.RRDamperLen);
@@ -216,6 +216,6 @@ namespace Telemetry
         sock.Write(vps.RRBreakNormedCoef);
         sock.Write(vps.RRTireWear01);
         sock.Write(vps.RRIcing01);
-        return sock.Write(vps.RRGroundContactMaterial);
+        return sock.Write(uint(vps.RRGroundContactMaterial));
     }
 }

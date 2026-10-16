@@ -14,10 +14,20 @@ void Main() {
     Reset();
 }
 
-void ConnectSocket() {
+bool TryConnect() {
     @sock = Net::Socket();
-    while (!sock.Connect(socket_host, socket_port)) sleep(1000);
-    while (!sock.CanWrite()) sleep(1000);
+    if (!sock.Connect(socket_host, socket_port)) return false;
+    // Connect is asynchronous: wait for the handshake, give up after 3 s (nothing listening yet) and retry
+    uint64 start = Time::Now;
+    while (!sock.IsReady()) {
+        if (3000 < Time::Now - start) { sock.Close(); return false; }
+        yield();
+    }
+    return true;
+}
+
+void ConnectSocket() {    while (!TryConnect()) sleep(1000);
+    // (TryConnect waits for the socket to be ready)
     print("Connected to python script !");
     Telemetry::SendConfig(sock);
     print("Headers sent !");
