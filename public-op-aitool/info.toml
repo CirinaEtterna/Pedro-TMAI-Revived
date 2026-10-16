@@ -1,0 +1,9 @@
+[meta]
+name = "AI Tool"
+author = "Pedro"
+category = "Artificial Intelligence"
+
+version = "1.0"
+
+[script]
+dependencies = [ "VehicleState" ]
