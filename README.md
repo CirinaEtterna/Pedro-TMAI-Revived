@@ -1,8 +1,8 @@
 # Pedro-TMAI Revived: PedroAI
 
 > **In honor of Pedro.** Pedro started PedroAI in April 2020, streamed its training on Twitch from
-> April 2021 to September 2023, and then open-sourced it. On **October 15, 2026**, one month before his
-> birthday (November 15), we picked his work up again. The AI and this project carry his name.
+> April 2021 to September 2023, and then open-sourced it. On **October 15, 2026**, one month before redm00n's
+> birthday (November 15), he picked his work up again. The AI and this project carry his name.
 
 Windows port of the open-sourced [PedroAI](https://github.com/trackmania-ai) Trackmania AI. It's a
 DQN agent that drives Trackmania 2020 from the game image plus Openplanet telemetry. The original
